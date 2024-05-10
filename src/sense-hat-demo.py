@@ -5,7 +5,11 @@ import time
 from typing import List
 
 import numpy as np
-from sense_emu import SenseHat, InputEvent
+try:
+    from sense_hat import SenseHat
+except ModuleNotFoundError:
+    print('unable to import sense_hat. Trying to import sense_emu.')
+    from sense_emu import SenseHat
 import cv2
 
 
@@ -84,7 +88,7 @@ class Main:
         pixel_list = image.reshape((8 * 8, 3))
         self.sense.set_pixels(pixel_list)
 
-    def handle_event(self, event: InputEvent):
+    def handle_event(self, event):
         if self.mode == Mode.Image:
             if event.action == 'released' and event.direction == 'middle':
                 self.mode = Mode.BrickGame
