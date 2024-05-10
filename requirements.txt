@@ -1,0 +1,7 @@
+numpy==1.26.4
+opencv-python==4.9.0.80
+pillow==10.3.0
+pycairo==1.26.0
+PyGObject==3.48.2
+sense-emu==1.2.1
+sense-hat==2.6.0
