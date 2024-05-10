@@ -2,63 +2,106 @@
 import enum
 import os
 import time
-from dataclasses import dataclass
-from typing import Dict
+from typing import List
 
 import numpy as np
 from sense_emu import SenseHat, InputEvent
 import cv2
 
 
-IMAGE_DIR = 'images'
-
-
-def load_scaled_images(target_size) -> Dict[str, np.ndarray]:
-    images = {}
-    for filename in os.listdir(IMAGE_DIR):
-        path = os.path.join(IMAGE_DIR, filename)
-        name = os.path.splitext(filename)[0]
-        if path.endswith('.jpg') or path.endswith('.png'):
-            image = cv2.imread(path)
-            image = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            images[name] = image
-    return images
-
-
-def rotate_image(image, angle):
-    """
-    From https://stackoverflow.com/questions/9041681/opencv-python-rotate-image-by-x-degrees-around-specific-point
-    """
-    image_center = tuple(np.array(image.shape[1::-1]) / 2)
-    rot_mat = cv2.getRotationMatrix2D(image_center, angle, 1.0)
-    result = cv2.warpAffine(image, rot_mat, image.shape[1::-1], flags=cv2.INTER_LINEAR)
-    return result
-
-
-def change_hsv(image, hue=0, saturation=1, value=1):
-    hsv_image = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.int32)
-    if hue:
-        hsv_image[..., 0] = hsv_image[..., 0] + hue
-        hsv_image[hsv_image < 0] += 255
-        hsv_image[hsv_image > 255] -= 255
-    if saturation != 1:
-        hsv_image[..., 1] = hsv_image[..., 1] * saturation
-    if value != 1:
-        hsv_image[..., 2] = hsv_image[..., 2] * value
-    hsv_image = np.clip(hsv_image, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(hsv_image, cv2.COLOR_HSV2RGB)
-
-
 class Mode(enum.Enum):
     Image = 0
     BrickGame = 1
+    Temperature = 2
 
 
 class GameMode(enum.Enum):
     InGame = 0
     Won = 1
     Lost = 2
+
+
+class Main:
+    def __init__(self):
+        self.sense = SenseHat()
+        self.images = load_scaled_images((8, 8))
+        self.current_image_index = 0
+        self.game_state = GameState()
+        self.mode = Mode.Image
+
+    def run(self):
+        while True:
+            for event in self.sense.stick.get_events():
+                self.handle_event(event)
+            self.tick()
+            self.render()
+            time.sleep(0.05)
+
+    def render(self):
+        if self.mode == Mode.Image:
+            image = self.images[self.current_image_index]
+            modified_image = change_hsv(image, saturation=self._get_saturation(), hue=self._get_hue())
+            self._show_image(modified_image)
+        elif self.mode == Mode.BrickGame:
+            if self.game_state.game_mode == GameMode.InGame:
+                image = self.game_state.get_pixels()
+                self._show_image(image)
+            elif self.game_state.game_mode == GameMode.Lost:
+                self.sense.show_message('Verloren :(')
+                time.sleep(0.5)
+                self.mode = Mode.Temperature
+            elif self.game_state.game_mode == GameMode.Won:
+                self.sense.show_message('Gewonnen :)')
+                time.sleep(0.5)
+                self.mode = Mode.Temperature
+        elif self.mode == Mode.Temperature:
+            temp = max(int(round(self.sense.get_temperature())), 0)
+            temp_str = str(temp)
+            pixels = np.zeros((8, 8, 3))
+            digit1 = digit_to_np(int(temp_str[0]))
+            pixels[1:6, :3, :] = digit1
+            if temp >= 10:
+                digit2 = digit_to_np(int(temp_str[1]))
+                pixels[1:6, 4:7, :] = digit2
+            self._show_image(pixels.astype(np.uint8))
+
+    def tick(self):
+        if self.mode == Mode.BrickGame:
+            self.game_state.tick()
+
+    def _get_saturation(self):
+        pitch = self.sense.get_accelerometer()['pitch']
+        if pitch > 180:
+            pitch = -(360 - pitch)
+        saturation = np.clip((pitch + 45) / 60, 0, 2)
+        return saturation
+
+    def _get_hue(self):
+        roll = self.sense.get_accelerometer()['roll']
+        return roll / 360 * 255
+
+    def _show_image(self, image):
+        pixel_list = image.reshape((8 * 8, 3))
+        self.sense.set_pixels(pixel_list)
+
+    def handle_event(self, event: InputEvent):
+        if self.mode == Mode.Image:
+            if event.action == 'released' and event.direction == 'middle':
+                self.mode = Mode.BrickGame
+                self.game_state = GameState()
+            elif event.action == 'released':
+                if event.direction in ('left', 'down'):
+                    self.current_image_index = (self.current_image_index - 1) % len(self.images)
+                if event.direction in ('right', 'up'):
+                    self.current_image_index = (self.current_image_index + 1) % len(self.images)
+        elif self.mode == Mode.BrickGame:
+            if event.action == 'released' and event.direction == 'middle':
+                self.mode = Mode.Temperature
+            if event.action in ('pressed', 'held') and event.direction in ('left', 'right'):
+                self.game_state.handle_event(event.direction)
+        elif self.mode == Mode.Temperature:
+            if event.action == 'released' and event.direction == 'middle':
+                self.mode = Mode.Image
 
 
 class GameState:
@@ -134,67 +177,127 @@ class GameState:
         self.player_position = np.clip(self.player_position + direction, 0, 6)
 
 
-class Main:
-    def __init__(self):
-        self.sense = SenseHat()
-        target_size = (8, 8)
-        self.images = load_scaled_images(target_size)
-        self.game_state = GameState()
-        self.mode = Mode.Image
+def load_scaled_images(target_size) -> List[np.ndarray]:
+    images = []
+    image_dir = 'images'
+    for filename in os.listdir(image_dir):
+        path = os.path.join(image_dir, filename)
+        if path.endswith('.jpg') or path.endswith('.png'):
+            image = cv2.imread(path)
+            image = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            images.append(image)
+    return images
 
-    def run(self):
-        while True:
-            for event in self.sense.stick.get_events():
-                self.handle_event(event)
-            self.tick()
-            self.render()
-            time.sleep(0.05)
 
-    def render(self):
-        if self.mode == Mode.Image:
-            island = self.images['island']
-            new_image = change_hsv(island, saturation=self._get_saturation(), hue=self._get_hue())
-            self._show_image(new_image)
-        elif self.mode == Mode.BrickGame:
-            if self.game_state.game_mode == GameMode.InGame:
-                image = self.game_state.get_pixels()
-                self._show_image(image)
-            elif self.game_state.game_mode == GameMode.Lost:
-                self.sense.show_message('Verloren :(')
-                self.mode = Mode.Image
-            elif self.game_state.game_mode == GameMode.Won:
-                self.sense.show_message('Gewonnen :)')
-                self.mode = Mode.Image
+def rotate_image(image, angle):
+    """
+    From https://stackoverflow.com/questions/9041681/opencv-python-rotate-image-by-x-degrees-around-specific-point
+    """
+    image_center = tuple(np.array(image.shape[1::-1]) / 2)
+    rot_mat = cv2.getRotationMatrix2D(image_center, angle, 1.0)
+    result = cv2.warpAffine(image, rot_mat, image.shape[1::-1], flags=cv2.INTER_LINEAR)
+    return result
 
-    def tick(self):
-        if self.mode == Mode.BrickGame:
-            self.game_state.tick()
 
-    def _get_saturation(self):
-        pitch = self.sense.get_accelerometer()['pitch']
-        if pitch > 180:
-            pitch = -(360 - pitch)
-        saturation = np.clip((pitch + 45) / 60, 0, 2)
-        return saturation
+def change_hsv(image, hue=0, saturation=1, value=1):
+    hsv_image = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.int32)
+    if hue:
+        hsv_image[..., 0] = hsv_image[..., 0] + hue
+        hsv_image[hsv_image < 0] += 255
+        hsv_image[hsv_image > 255] -= 255
+    if saturation != 1:
+        hsv_image[..., 1] = hsv_image[..., 1] * saturation
+    if value != 1:
+        hsv_image[..., 2] = hsv_image[..., 2] * value
+    hsv_image = np.clip(hsv_image, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(hsv_image, cv2.COLOR_HSV2RGB)
 
-    def _get_hue(self):
-        roll = self.sense.get_accelerometer()['roll']
-        return roll / 360 * 255
 
-    def _show_image(self, image):
-        pixel_list = image.reshape((8 * 8, 3))
-        self.sense.set_pixels(pixel_list)
-
-    def handle_event(self, event: InputEvent):
-        if self.mode == Mode.Image:
-            if event.action == 'released' and event.direction == 'middle':
-                self.mode = Mode.BrickGame
-                self.game_state = GameState()
-        elif self.mode == Mode.BrickGame:
-            if event.action == 'released' and event.direction == 'middle':
-                self.mode = Mode.Image
-            if event.action in ('pressed', 'held') and event.direction in ('left', 'right'):
-                self.game_state.handle_event(event.direction)
+def digit_to_np(digit: int) -> np.ndarray:
+    if digit == 0:
+        arr = np.array([
+            [1, 1, 1],
+            [1, 0, 1],
+            [1, 0, 1],
+            [1, 0, 1],
+            [1, 1, 1],
+        ])
+    elif digit == 1:
+        arr = np.array([
+            [0, 1, 0],
+            [0, 1, 0],
+            [0, 1, 0],
+            [0, 1, 0],
+            [0, 1, 0],
+        ])
+    elif digit == 2:
+        arr = np.array([
+            [1, 1, 1],
+            [0, 0, 1],
+            [1, 1, 1],
+            [1, 0, 0],
+            [1, 1, 1],
+        ])
+    elif digit == 3:
+        arr = np.array([
+            [1, 1, 1],
+            [0, 0, 1],
+            [1, 1, 1],
+            [0, 0, 1],
+            [1, 1, 1],
+        ])
+    elif digit == 4:
+        arr = np.array([
+            [1, 0, 1],
+            [1, 0, 1],
+            [1, 1, 1],
+            [0, 0, 1],
+            [0, 0, 1],
+        ])
+    elif digit == 5:
+        arr = np.array([
+            [1, 1, 1],
+            [1, 0, 0],
+            [1, 1, 1],
+            [0, 0, 1],
+            [1, 1, 1],
+        ])
+    elif digit == 6:
+        arr = np.array([
+            [1, 1, 1],
+            [1, 0, 0],
+            [1, 1, 1],
+            [1, 0, 1],
+            [1, 1, 1],
+        ])
+    elif digit == 7:
+        arr = np.array([
+            [1, 1, 1],
+            [0, 0, 1],
+            [0, 0, 1],
+            [0, 0, 1],
+            [0, 0, 1],
+        ])
+    elif digit == 8:
+        arr = np.array([
+            [1, 1, 1],
+            [1, 0, 1],
+            [1, 1, 1],
+            [1, 0, 1],
+            [1, 1, 1],
+        ])
+    elif digit == 9:
+        arr = np.array([
+            [1, 1, 1],
+            [1, 0, 1],
+            [1, 1, 1],
+            [0, 0, 1],
+            [1, 1, 1],
+        ])
+    else:
+        raise ValueError('Not a digit: {}'.format(str(digit)))
+    return arr.reshape((*arr.shape, 1)) * np.array([255, 255, 255]).reshape(1, 1, 3)
 
 
 if __name__ == '__main__':
