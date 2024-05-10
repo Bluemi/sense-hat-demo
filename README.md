@@ -1,5 +1,5 @@
 # SenseHat - Demo
-Small demonstration program for the raspberry pi sense hat
+Small demonstration program for the RaspberryPi SenseHat.
 
 ## Usage
 There are three modes. You can switch between modes by pressing the `middle` button of the joystick.
